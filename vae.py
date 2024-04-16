@@ -160,16 +160,16 @@ class AttnBlock(nn.Module):
 
         # compute attention
         b,c,h,w = q.shape
-        q = torch.einsum(q, 'b c h w -> b (h w) c')
-        k = torch.einsum(k, 'b c h w -> b c (h w)')
-        w_ = torch.einsum('bij, bjk->bik', q, k)
+        q = rearrange(q, 'b c h w -> b c (h w)')
+        k = rearrange(k, 'b c h w -> b c (h w)')
+        w_ = torch.einsum('bij, bik->bjk', q, k)
         w_ = w_ * (int(c)**(-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
         # attend to values
-        v = torch.einsum(v, 'b c h w -> b c (h w)')
+        v = rearrange(v, 'b c h w -> b c (h w)')
         x = torch.einsum('bik,bjk->bji', w_, v)
-        x = torch.einsum(x, 'b c (h w)-> b c h w', h=h, w=w)
+        x = rearrange(x, 'b c (h w)-> b c h w', h=h, w=w)
 
         x = self.proj_out(x)
 
@@ -221,16 +221,16 @@ class MultiHeadAttnBlock(nn.Module):
 
         # compute attention
         b,c,h,w = q.shape
-        q = torch.einsum(q, 'b (c heads) h w -> b heads (h w) c', heads=self.n_heads)
-        k = torch.einsum(k, 'b (c heads) h w -> b heads c (h w)', heads=self.n_heads)
+        q = rearrange(q, 'b (c heads) h w -> b heads (h w) c', heads=self.n_heads)
+        k = rearrange(k, 'b (c heads) h w -> b heads c (h w)', heads=self.n_heads)
         w_ = torch.einsum('bhij, bhjk->bhik', q, k)
         w_ = w_ * (int(c)**(-0.5))
         w_ = torch.nn.functional.softmax(w_, dim=2)
 
         # attend to values
-        v = torch.einsum(v, 'b (c heads) h w -> b heads c (h w)', heads=self.n_heads)
+        v = rearrange(v, 'b (c heads) h w -> b heads c (h w)', heads=self.n_heads)
         x = torch.einsum('bhik,bhjk->bhji', w_, v)
-        x = torch.einsum(x, 'b heads c (h w)-> b (c heads) h w', h=h, w=w)
+        x = rearrange(x, 'b heads c (h w)-> b (c heads) h w', h=h, w=w)
 
         x = self.proj_out(x)
 
@@ -258,28 +258,28 @@ class LinearAttnBlock(nn.Module):
     def forward(self, x):
         b, c, h, w = x.shape
         qkv = self.conv1(x)
-        q, k, v = rearrange(qkv, 'b, (qkv heads c) h w -> qkv b heads c (h w)', qkv=3, heads=self.n_heads)
+        q, k, v = rearrange(qkv, 'b (qkv heads c) h w -> qkv b heads c (h w)', qkv=3, heads=self.n_heads)
         k = k.softmax(dim=-1)
         weights = torch.einsum('bhdn, bhen->bhde', q, k)
         out = torch.einsum('bhde,bhdn->bhen', weights, v)
-        out = rearrange(out, 'b heads c (h w)->b (heads c) h w', heads=self.heads, h=h, w=w)
-        return out
+        out = rearrange(out, 'b heads c (h w)->b (heads c) h w', heads=self.n_heads, h=h, w=w)
+        return self.conv2(out)
     
-def make_attn(in_channels, attn_type='vanilla', n_heads=None):
+def make_attn(in_channels, attn_type='vanilla', hidden_size=1024, n_heads=8):
     assert attn_type in ['vanilla', 'multihead', 'linear', 'None']
     if attn_type == 'vanilla':
         return AttnBlock(in_channels)
     elif attn_type == 'multihead' and n_heads is not None:
         return MultiHeadAttnBlock(in_channels, n_heads)
     elif attn_type == 'linear':
-        return LinearAttnBlock(in_channels)
+        return LinearAttnBlock(in_channels, hidden_size, n_heads)
     else:
         return nn.Identity(in_channels)
     
 class Encoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
-                 resolution, z_channels, double_z=True, use_linear_attn=False, attn_type="vanilla",
+                 resolution, z_channels, double_z=True, use_linear_attn=False, attn_type='vanilla',
                  **ignore_kwargs) -> None:
         super().__init__()
         if use_linear_attn: attn_type = 'linear'
@@ -303,7 +303,7 @@ class Encoder(nn.Module):
         in_ch_multi = (1,) + tuple(ch_mult)
         self.in_ch_multi = in_ch_multi
         self.down = nn.ModuleList()
-        for i_level in range(resolution):
+        for i_level in range(self.num_resolution):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_in = ch * in_ch_multi[i_level]
@@ -333,7 +333,7 @@ class Encoder(nn.Module):
             temb_channels=self.temb_ch,
             dropout=dropout,
         )
-        self.mid.attn1 = make_attn(block_in, resamp_with_conv)
+        self.mid.attn1 = make_attn(block_in, attn_type=attn_type)
         self.mid.block2 = ResnetBlock(
             in_channels=block_in,
             out_channels=block_in,
@@ -356,7 +356,7 @@ class Encoder(nn.Module):
 
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolution):
-            for i_blcok in range(len(self.num_res_blocks)):
+            for i_blcok in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_blcok](hs[-1], temb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_blcok](h)
@@ -366,12 +366,12 @@ class Encoder(nn.Module):
         
         # middle
         h = hs[-1]
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = self.mid.block1(h, temb)
+        h = self.mid.attn1(h)
+        h = self.mid.block2(h, temb)
 
         # end
-        h = self.norm_out(h)
+        h = self.norm(h)
         h = h * torch.sigmoid(h)
         h = self.conv_out(h)
         return h
@@ -381,7 +381,7 @@ class Decoder(nn.Module):
     def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
                  attn_resolutions, dropout=0.0, resamp_with_conv=True, in_channels,
                  resolution, z_channels, give_pre_end=False, tanh_out=False, use_linear_attn=False,
-                 attn_type="vanilla", **ignorekwargs):
+                 attn_type='vanilla', **ignorekwargs):
         super().__init__()
         if use_linear_attn: attn_type = "linear"
         self.ch = ch
@@ -526,13 +526,50 @@ class DiagonalGaussianDistribution(object):
         return self.mean
 
 class AutoEncoderKL(nn.Module):
-    def __init__(self, ddconfig, embed_dim) -> None:
+    def __init__(self,
+                embed_dim,
+                double_z=True, 
+                z_channels=16,
+                resolution=256,
+                in_channels=3,
+                out_ch=3,
+                ch=128,
+                ch_mult=[ 1,1,2,2,4],  # num_down = len(ch_mult)-1
+                num_res_blocks=2,
+                attn_resolutions=[16],
+                dropout=0.0,
+                attn_type='multihead',
+                ) -> None:
         super().__init__()
-        self.encoder = Encoder(**ddconfig)
-        self.decoder = Decoder(**ddconfig)
-        assert ddconfig["double_z"]
-        self.quant_conv = nn.Conv2d(2*ddconfig["z_channels"], 2*embed_dim, 1)
-        self.post_quant_conv = nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.encoder = Encoder(
+                double_z=double_z, 
+                z_channels=z_channels,
+                resolution=resolution,
+                in_channels=in_channels,
+                out_ch=out_ch,
+                ch=ch,
+                ch_mult=ch_mult,  # num_down = len(ch_mult)-1
+                num_res_blocks=num_res_blocks,
+                attn_resolutions=attn_resolutions,
+                dropout=dropout,
+                attn_type=attn_type
+            )
+        self.decoder = Decoder(
+                double_z=double_z, 
+                z_channels=z_channels,
+                resolution=resolution,
+                in_channels=in_channels,
+                out_ch=out_ch,
+                ch=ch,
+                ch_mult=ch_mult,  # num_down = len(ch_mult)-1
+                num_res_blocks=num_res_blocks,
+                attn_resolutions=attn_resolutions,
+                dropout=dropout,
+                attn_type=attn_type
+            )
+        assert double_z
+        self.quant_conv = nn.Conv2d(2*z_channels, 2*embed_dim, 1)
+        self.post_quant_conv = nn.Conv2d(embed_dim, z_channels, 1)
 
     def encode(self, x):
         h = self.encoder(x)
@@ -554,15 +591,18 @@ class AutoEncoderKL(nn.Module):
         dec = self.decode(z)
         return dec, posterior
 
+model = AutoEncoderKL(128)
+x = torch.randn(4,3,256,256)
+y, _ = model(x)
+print(y.shape)
 
-# ddconfig:
-#     double_z: True
-#     z_channels: 16
-#     resolution: 256
-#     in_channels: 3
-#     out_ch: 3
-#     ch: 128
-#     ch_mult: [ 1,1,2,2,4]  # num_down = len(ch_mult)-1
-#     num_res_blocks: 2
-#     attn_resolutions: [16]
-#     dropout: 0.0
+# double_z: True
+# z_channels: 16
+# resolution: 256
+# in_channels: 3
+# out_ch: 3
+# ch: 128
+# ch_mult: [ 1,1,2,2,4]  # num_down = len(ch_mult)-1
+# num_res_blocks: 2
+# attn_resolutions: [16]
+# dropout: 0.0
